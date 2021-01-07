@@ -3,6 +3,9 @@ from torch import Tensor
 import torch.nn as nn
 from .utils import load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
+# For cost estimator
+from ..common_types import _size_1_t, _size_2_t, _size_3_t
+
 
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -21,6 +24,42 @@ model_urls = {
     'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
+
+class CostSim:
+    class Layer:
+        def __init__(self, module, name, config, prevLayers):
+            # self.layerId = layerId
+            self.name = name
+            # self.modelBytes = modelBytes
+            self.prevLayers = prevLayers                    # [(LayerId, inputByteSize), ...]
+            self.module = module
+
+    def __init__(self):
+        self.layers = []
+    
+    def Conv2d(self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: _size_2_t,
+            stride: _size_2_t = 1,
+            padding: _size_2_t = 0,
+            dilation: _size_2_t = 1,
+            groups: int = 1,
+            bias: bool = True,
+            padding_mode: str = 'zeros',
+            custom_previous_layers: list = None):
+        module = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = CostSim.Layer(module, "conv2d",
+                            {"in_channels": in_channels, "out_channels": out_channels, "kernel_size": kernel_size, "stride": stride, "padding": padding},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        
+        return module
+    
+
 
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
