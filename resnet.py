@@ -58,7 +58,41 @@ class CostSim:
         self.layers.append(layer)
         
         return module
-    
+
+    def MaxPool2d(self,
+            kernel_size: _size_2_t,
+            stride: _size_2_t,
+            padding: _size_2_t,
+            dilation: _size_2_t,
+            custom_previous_layers: list = None):
+        module = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = CostSim.Layer(module, "maxPool2d",
+                            {"kernel_size": kernel_size, "stride": stride, "padding": padding},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
+    def AdaptiveAvgPool2d(self,
+            output_size,
+            custom_previous_layers: list = None):
+        module = nn.AdaptiveAvgPool2d(output_size)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        # stride = (input_size//output_size)  
+        # kernel_size = input_size - (output_size-1)*stride  
+        # padding = 0
+        layer = CostSim.Layer(module, "avgPool2d",
+                            {"output_size": output_size},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+        
 
 
 
