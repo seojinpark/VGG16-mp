@@ -1,12 +1,12 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from .utils import load_state_dict_from_url
+# from .utils import load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
 # For cost estimator
-from ..common_types import _size_1_t, _size_2_t, _size_3_t
-
-
+from torch.nn.common_types import _size_1_t, _size_2_t, _size_3_t
+from costSimulator import CostSim
+from costSimulator import GpuProfiler
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
            'resnet152', 'resnext50_32x4d', 'resnext101_32x8d',
@@ -25,86 +25,15 @@ model_urls = {
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
 
-class CostSim:
-    class Layer:
-        def __init__(self, module, name, config, prevLayers):
-            # self.layerId = layerId
-            self.name = name
-            # self.modelBytes = modelBytes
-            self.prevLayers = prevLayers                    # [(LayerId, inputByteSize), ...]
-            self.module = module
-
-    def __init__(self):
-        self.layers = []
-    
-    def Conv2d(self,
-            in_channels: int,
-            out_channels: int,
-            kernel_size: _size_2_t,
-            stride: _size_2_t = 1,
-            padding: _size_2_t = 0,
-            dilation: _size_2_t = 1,
-            groups: int = 1,
-            bias: bool = True,
-            padding_mode: str = 'zeros',
-            custom_previous_layers: list = None):
-        module = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode)
-
-        if custom_previous_layers == None and len(self.layers) > 0:
-            custom_previous_layers = [self.layers[-1]]
-        layer = CostSim.Layer(module, "conv2d",
-                            {"in_channels": in_channels, "out_channels": out_channels, "kernel_size": kernel_size, "stride": stride, "padding": padding},
-                            prevLayers = custom_previous_layers)
-        self.layers.append(layer)
-        
-        return module
-
-    def MaxPool2d(self,
-            kernel_size: _size_2_t,
-            stride: _size_2_t,
-            padding: _size_2_t,
-            dilation: _size_2_t,
-            custom_previous_layers: list = None):
-        module = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)
-
-        if custom_previous_layers == None and len(self.layers) > 0:
-            custom_previous_layers = [self.layers[-1]]
-        layer = CostSim.Layer(module, "maxPool2d",
-                            {"kernel_size": kernel_size, "stride": stride, "padding": padding},
-                            prevLayers = custom_previous_layers)
-        self.layers.append(layer)
-
-        return module
-
-    def AdaptiveAvgPool2d(self,
-            output_size,
-            custom_previous_layers: list = None):
-        module = nn.AdaptiveAvgPool2d(output_size)
-
-        if custom_previous_layers == None and len(self.layers) > 0:
-            custom_previous_layers = [self.layers[-1]]
-        # stride = (input_size//output_size)  
-        # kernel_size = input_size - (output_size-1)*stride  
-        # padding = 0
-        layer = CostSim.Layer(module, "avgPool2d",
-                            {"output_size": output_size},
-                            prevLayers = custom_previous_layers)
-        self.layers.append(layer)
-
-        return module
-        
-
-
-
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+    return cs.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 
-def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1, custom_previous_layers: list = None) -> nn.Conv2d:
     """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    return cs.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False, custom_previous_layers=custom_previous_layers)
 
 
 class BasicBlock(nn.Module):
@@ -170,7 +99,8 @@ class Bottleneck(nn.Module):
         inplanes: int,
         planes: int,
         stride: int = 1,
-        downsample: Optional[nn.Module] = None,
+        # downsample: Optional[nn.Module] = None,
+        downsampleParams: Optional[tuple] = None,
         groups: int = 1,
         base_width: int = 64,
         dilation: int = 1,
@@ -181,14 +111,21 @@ class Bottleneck(nn.Module):
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        layerSideBranch = cs.layers[-1]
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
         self.conv3 = conv1x1(width, planes * self.expansion)
         self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
+        layerMainBranch = cs.layers[-1]
+        if downsampleParams is not None:
+            convDownsample = conv1x1(*(downsampleParams[0]), [layerSideBranch])
+            layerSideBranch = cs.layers[-1]
+            self.downsample = nn.Sequential(convDownsample, norm_layer((downsampleParams[1])))
+        else:
+            self.downsample = None
+        self.relu = cs.ReLU(inplace=True, custom_previous_layers=[layerMainBranch, layerSideBranch])
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
@@ -243,11 +180,11 @@ class ResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
+        self.conv1 = cs.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = norm_layer(self.inplanes)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.relu = cs.ReLU(inplace=True)
+        self.maxpool = cs.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
@@ -255,8 +192,8 @@ class ResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.avgpool = cs.AdaptiveAvgPool2d((1, 1))
+        self.fc = cs.Linear(512 * block.expansion, num_classes)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -278,19 +215,21 @@ class ResNet(nn.Module):
     def _make_layer(self, block: Type[Union[BasicBlock, Bottleneck]], planes: int, blocks: int,
                     stride: int = 1, dilate: bool = False) -> nn.Sequential:
         norm_layer = self._norm_layer
-        downsample = None
+        # downsample = None
+        downsampleParams = None
         previous_dilation = self.dilation
         if dilate:
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),
-            )
+            # downsample = nn.Sequential(
+            #     conv1x1(self.inplanes, planes * block.expansion, stride),
+            #     norm_layer(planes * block.expansion),
+            # )
+            downsampleParams = ( (self.inplanes, planes * block.expansion, stride), (planes * block.expansion) )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+        layers.append(block(self.inplanes, planes, stride, downsampleParams, self.groups,
                             self.base_width, previous_dilation, norm_layer))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
@@ -460,3 +399,11 @@ def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: 
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet101_2', Bottleneck, [3, 4, 23, 3],
                    pretrained, progress, **kwargs)
+
+
+cs = CostSim()
+model = resnet50()
+cs.printAllLayers()
+cs.computeInputDimensions((224,224,3))
+gpuProfiler = GpuProfiler("cuda")
+gpuProfiler.runConv2dBench()
