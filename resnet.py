@@ -403,7 +403,12 @@ def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: 
 
 cs = CostSim()
 model = resnet50()
+# model = resnet18()
+# model = resnet34()
 cs.printAllLayers()
 cs.computeInputDimensions((224,224,3))
-gpuProfiler = GpuProfiler("cuda")
-gpuProfiler.runConv2dBench()
+profiler = GpuProfiler("cuda")
+profiler.loadProfile()
+cs.searchBestSplits(profiler, 16, 16)
+profiler.saveProfile()
+

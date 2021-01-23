@@ -8,6 +8,10 @@ from torch.autograd import Variable
 import time
 from typing import Type, Any, Callable, Union, List, Optional
 from torch.nn.common_types import _size_1_t, _size_2_t, _size_3_t
+import math
+import jsonpickle
+import json
+import numpy
 
 class Perf(object):
     def __init__(self, eidToStr = {}):
@@ -86,9 +90,31 @@ class Perf(object):
 class GpuProfiler:
     def __init__(self, device):
         self.conv2dBenchCache = {}
+        self.benchCacheHit = 0
+        self.benchCacheMiss = 0
+        self.linearBenchCache = {}
         self.device = device
 
-    def train(self, args, model, device, train_loader, criterion, optimizer, epoch, perf):
+    def saveProfile(self, path = "gpuProfile.json"):
+        with open(path, "w") as outfile:
+            data = {"conv2dBenchCache": self.conv2dBenchCache, "linearBenchCache": self.linearBenchCache}
+            planInJson = jsonpickle.encode(data, unpicklable=False)
+            json.dump(json.loads(planInJson), outfile, indent=2, sort_keys=False)
+            print("[GpuProfiler] Saved %d entries." % (len(self.conv2dBenchCache) + len(self.linearBenchCache)))
+            print("[GpuProfiler] Cache hit %3.1f %%" % (100 * self.benchCacheHit / (self.benchCacheHit + self.benchCacheMiss)))
+    
+    def loadProfile(self, path = "gpuProfile.json"):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+                if "conv2dBenchCache" in data:
+                    self.conv2dBenchCache = data["conv2dBenchCache"]
+                if "linearBenchCache" in data:
+                    self.linearBenchCache = data["linearBenchCache"]
+        except IOError:
+            print("[GpuProfiler] No profile file exists at %s." % path)
+
+    def train(self, model, device, train_loader, criterion, optimizer, epoch, perf):
         model.train()
         # iter_to_capture = 50
         # with torch.autograd.profiler.emit_nvtx():
@@ -134,9 +160,11 @@ class GpuProfiler:
         
             iterationCount += 1
 
-    def runConv2dBench(self, config, args):
-        if config in self.conv2dBenchCache:
-            return self.conv2dBenchCache[config]
+    def runConv2dBench(self, config):
+        if str(config) in self.conv2dBenchCache:
+            self.benchCacheHit += 1
+            return self.conv2dBenchCache[str(config)]
+        self.benchCacheMiss += 1
         batchSize = config[0]
         width = config[1]
         height = config[2]
@@ -147,18 +175,22 @@ class GpuProfiler:
                 train_dataset, batch_size=batchSize, shuffle=False, pin_memory=True, drop_last=True)
 
         model = self.Conv2dOp(inChannels, filterCount).to(self.device)
-        optimizer = torch.optim.Adadelta(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.Adadelta(model.parameters())
         criterion = nn.CrossEntropyLoss().cuda(self.device)
 
         perfStat = Perf({0: 'load', 1: 'zero', 2: 'fp', 3: 'loss', 4: 'bp', 5: 'opt', 6: 'total/bat', 7: 'totalCPU'})
-        scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-        self.train(args, model, self.device, train_loader, criterion, optimizer, 1, perfStat)
+        scheduler = StepLR(optimizer, step_size=1)
+        self.train(model, self.device, train_loader, criterion, optimizer, 1, perfStat)
         # scheduler.step()
         gpuTime = perfStat.getStat(2) + perfStat.getStat(4)
-        self.conv2dBenchCache[config] = gpuTime
+        self.conv2dBenchCache[str(config)] = gpuTime
         return gpuTime
 
-    def runLinearBench(self, config, args):
+    def runLinearBench(self, config):
+        if str(config) in self.linearBenchCache:
+            self.benchCacheHit += 1
+            return self.linearBenchCache[str(config)]
+        self.benchCacheMiss += 1
         batchSize = config[0]
         inFeatures = config[1]
         outFeatures = config[2]
@@ -167,14 +199,15 @@ class GpuProfiler:
                 train_dataset, batch_size=batchSize, shuffle=False, pin_memory=True, drop_last=True)
 
         model = self.LinearOp(inFeatures, outFeatures).to(self.device)
-        optimizer = torch.optim.SGD(model.parameters(), args.lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         criterion = nn.CrossEntropyLoss().cuda(self.device)
         
         perfStat = Perf({0: 'load', 1: 'zero', 2: 'fp', 3: 'loss', 4: 'bp', 5: 'opt', 6: 'total/bat', 7: 'totalCPU'})
-        scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-        self.train(args, model, self.device, train_loader, criterion, optimizer, 1, perfStat)
+        scheduler = StepLR(optimizer, step_size=1)
+        self.train(model, self.device, train_loader, criterion, optimizer, 1, perfStat)
         # scheduler.step()
         gpuTime = perfStat.getStat(2) + perfStat.getStat(4)
+        self.linearBenchCache[str(config)] = gpuTime
         return gpuTime
 
 
@@ -190,7 +223,7 @@ class GpuProfiler:
 
     class Conv2dOp(nn.Module):
         def __init__(self, inChannels, filterCount, num_classes=1000):
-            super(self.Conv2dOp, self).__init__()
+            super(GpuProfiler.Conv2dOp, self).__init__()
             self.num_classes = num_classes
             self.conv1 = nn.Conv2d(inChannels, filterCount, (3, 3), (1, 1), (1, 1))
         def forward(self, x):
@@ -199,7 +232,7 @@ class GpuProfiler:
     
     class LinearOp(nn.Module):
         def __init__(self, inFeatures, outFeatures):
-            super(self.LinearOp, self).__init__()
+            super(GpuProfiler.LinearOp, self).__init__()
             self.linear1 = nn.Linear(inFeatures, outFeatures)
         def forward(self, x):
             x = self.linear1(x)
@@ -211,7 +244,11 @@ class CostSim:
         def __init__(self, module: nn.Module, name: str, params: tuple, prevLayers: list):
             self.name = name
             self.params = params
-            self.prevLayers = prevLayers                    # [(LayerId, inputByteSize), ...]
+            self.prevLayers = prevLayers
+            if prevLayers is not None:
+                for prevLayer in prevLayers:
+                    prevLayer.nextLayers.append(self)
+            self.nextLayers = []
             self.module = module
             self.inputDim = (0, 0, 0)   # (Width, Height, Channel) for 2d convolution
             self.outputDim = (0, 0, 0)  # (Width, Height, Channel)
@@ -219,17 +256,23 @@ class CostSim:
     def __init__(self, netBw = 1.25E4):
         self.layers = []
         self.NET_BANDWIDTH = netBw
+        self.NET_LATENCY = 10
 
     def printAllLayers(self):
         #TODO: topological sort of layers. Right now, assume it's sorted.
         for i in range(len(self.layers)):
+            self.layers[i].id = i
+        for i in range(len(self.layers)):
             layer = self.layers[i]
-            layer.id = i
+            # layer.id = i
             prevLayerIds = []
             if layer.prevLayers != None:
                 for prevLayer in layer.prevLayers:
                     prevLayerIds.append(prevLayer.id)
-            print("%3d %10s %70s %10s" % (i, layer.name, str(layer.params), str(prevLayerIds)) )
+            nextLayerIds = []
+            for l in layer.nextLayers:
+                nextLayerIds.append(l.id)
+            print("%3d %10s %10s %10s %70s" % (i, layer.name, str(prevLayerIds), str(nextLayerIds), str(layer.params)) )
     
     def computeInputDimensions(self, inputDim):
         for i in range(len(self.layers)):
@@ -256,20 +299,26 @@ class CostSim:
                 layer.outputDim = (layer.params["output_width"], layer.params["output_height"], layer.inputDim[2])
             elif layer.name == "linear":
                 layer.outputDim = (layer.params["out_features"])
-            elif layer.name == "ReLU":
+            elif layer.name in ["ReLU2d", "ReLU1d", "ReLU"]:
                 layer.outputDim = layer.inputDim
+            elif layer.name == "flatten":
+                layer.outputDim = numpy.prod(layer.inputDim)
 
             print("%3d %10s %20s %20s %s" % (i, layer.name, str(layer.inputDim), str(layer.outputDim), str(layer.params)) )
     
     def calcInputXfer(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple):
-        if srcLayer.name in ["conv2d", "maxPool2d", "avgPool2d", "ReLU"] and \
-                destLayer.name in ["conv2d", "maxPool2d", "avgPool2d"]:
-            return self.calcConv2dActivationTime(srcConfig, destConfig, destLayer.inputDim)
-        elif srcLayer.name in ["conv2d", "maxPool2d", "avgPool2d", "linear", "ReLU"] and \
-                destLayer.name in ["linear"]:
+        namesIn2d = ["conv2d", "maxPool2d", "avgPool2d", "ReLU2d"]
+        namesIn1d = ["linear", "ReLU1d"]
+
+        if srcLayer.name in namesIn2d and \
+                destLayer.name in namesIn2d + ["flatten"]:
+            return self.calc2dActivationTime(srcLayer, destLayer, srcConfig, destConfig)
+            #srcConfig, destConfig, destLayer.inputDim)
+        elif srcLayer.name in namesIn1d + ["flatten"] and \
+                destLayer.name in namesIn1d:
             return self.calcLinearActivationTime(srcConfig, destConfig, destLayer.inputDim)
-        elif destLayer.name in ["ReLU"]:
-            return 0
+        # elif destLayer.name in ["ReLU"]:
+        #     return 0
         else:
             print("Can't compute input transfer time from %s to %s." % (srcLayer.name, destLayer.name))
 
@@ -279,48 +328,35 @@ class CostSim:
         size = params * bytesPerParam
         return size / self.NET_BANDWIDTH # Returns microseconds.
         
-    def calcConv2dActivationTime(self, prevCfg, config, inputDim, bytesPerInput=4):
-        # batchSize = config[0]
-        # width = config[1]
-        # height = config[2]
-        # inChannels = config[3]
-        # filterCount = config[4]
-        
-        activationTime = 0
-        # Change in batch size
-        if config[0] != prevCfg[0]:
-            xferSamples = abs(config[0]-prevCfg[0])
-            xferInput = config[1] * config[2]
-            inChannels = config[3]
-            size = xferSamples * xferInput * inChannels * bytesPerInput
-            activationTime += size / self.NET_BANDWIDTH
-        
-        # Change in input dimension
-        if config[1] != prevCfg[1] or config[2] != prevCfg[2]:
-            xferSamples = min(config[0], prevCfg[0])
-            xferInput = abs(config[1] * config[2] - prevCfg[1] * prevCfg[2])
-            inChannels = config[3]
-            size = xferSamples * xferInput * inChannels * bytesPerInput
-            activationTime += size / self.NET_BANDWIDTH
-        
-        # Halo exchange 
-        if config[1] != inputDim[1] or config[2] != inputDim[2]:
-            xferSamples = min(config[0], prevCfg[0])
-            halo = 2 * ((config[1] + 1) if config[1] != inputDim[1] else 0) + 2 * ((config[2] + 1) if config[2] != inputDim[2] else 0)
-            inChannels = config[3]
-            size = xferSamples * halo * inChannels * bytesPerInput
-            activationTime += size / self.NET_BANDWIDTH
-        
-        # Filter split (filter / channel mismatch)
-        if config[3] != prevCfg[4]:
-            xferSamples = min(config[0], prevCfg[0])
-            xferInput = config[1] * config[2]
-            xferChannels = config[3] - prevCfg[4]
-            size = xferSamples * xferInput * xferChannels * bytesPerInput
-            activationTime += size / self.NET_BANDWIDTH
-        
-        activationTime += 10 if activationTime > 0 else 0
-        return 2 * activationTime
+    def calc2dActivationTime(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple):
+        bytesPerParam = 4
+
+        # Compute output dimension of previous and current layer.
+        srcS = srcConfig[0]
+        srcW = srcConfig[1] * srcLayer.outputDim[0] // srcLayer.inputDim[0] # Adjusts based on input/output ratio. 
+        srcH = srcConfig[2] * srcLayer.outputDim[1] // srcLayer.inputDim[1] # It's necessary for pool or conv2d with stride > 1
+        srcOutChannel = srcConfig[4] if len(srcConfig) >= 5 else srcConfig[3] # non-convolutional 2d layers don't have filter.
+        destS = destConfig[0]
+        destW = destConfig[1]
+        destH = destConfig[2]
+        destInChannel = destConfig[3]
+
+        # Compute common part that doesn't have to move.
+        commonSize = bytesPerParam * min(srcS, destS) * min(srcW, destW) * min(srcH, destH) * min(srcOutChannel, destInChannel)
+
+        # Halo exchange
+        haloLen = int((destLayer.params["kernel_size"] - 1) / 2)
+        haloPixels = 2 * haloLen * ((destW + haloLen) if destW != destLayer.inputDim[1] else 0)\
+                     + 2 * haloLen * ((destH + haloLen) if destH != destLayer.inputDim[2] else 0)
+        haloSize = bytesPerParam * min(srcS, destS) * haloPixels * min(srcOutChannel, destInChannel)
+
+        # compute times
+        egressBytes = bytesPerParam * srcS * srcW * srcH * srcOutChannel - commonSize + haloSize
+        ingressBytes = bytesPerParam * destS * destW * destH * destInChannel - commonSize + haloSize
+        activationTime = max(egressBytes, ingressBytes) / self.NET_BANDWIDTH
+        activationTime += self.NET_LATENCY if activationTime > 0 else 0
+        print((egressBytes, ingressBytes, haloSize))
+        return (2 * activationTime, (egressBytes, ingressBytes, haloSize)) # double to count both forward and backward passes.
 
     def calcLinearSyncTime(self, config, globalBatch, bytesPerParam=4, alwaysPaySyncTime=False):
         if not alwaysPaySyncTime and config[0] == globalBatch: # No split.
@@ -362,7 +398,7 @@ class CostSim:
             activationTime += size / self.NET_BANDWIDTH
             activationTime += 10 if activationTime > 0 else 0
         
-        return 2 * activationTime
+        return (2 * activationTime, (config[0] * in_features * bytesPerInput))
 
     def Conv2d(self,
             in_channels: int,
@@ -389,7 +425,7 @@ class CostSim:
     def MaxPool2d(self,
             kernel_size: _size_2_t,
             stride: _size_2_t,
-            padding: _size_2_t,
+            padding: _size_2_t = 0,
             # dilation: _size_2_t = 1,
             custom_previous_layers: list = None):
         module = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding) #, dilation=dilation)
@@ -437,38 +473,94 @@ class CostSim:
 
         if custom_previous_layers == None and len(self.layers) > 0:
             custom_previous_layers = [self.layers[-1]]
-        layer = CostSim.Layer(module, "ReLU", {"inplace": inplace}, prevLayers = custom_previous_layers)
+        if custom_previous_layers[0].name in ["conv2d", "maxPool2d", "avgPool2d"]:
+            name = "ReLU2d"
+        elif custom_previous_layers[0].name in ["linear"]:
+            name = "ReLU1d"
+        else:
+            name = "ReLU"
+        layer = CostSim.Layer(module, name, {"inplace": inplace, "kernel_size": 1, "stride": 1, "padding": 0}, prevLayers = custom_previous_layers)
         self.layers.append(layer)
         
         return module
+    
+    def Flatten(self, custom_previous_layers: list = None):
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = CostSim.Layer(None, "flatten", {"kernel_size": 1}, prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        return
 
-    def searchBestSplits(self):
+    def searchBestSplits(self, profiler: GpuProfiler, totalGpus: int, globalBatch: int = 16):
         t = [[] for i in range(len(self.layers))] # [layer] = list of (config, cumulativeTime, prevConfigIndex)
 
+        initialConfigs = []
+        initialTimes = []
+        bestConfigList = []
+        bestTimeList = []
+        bestDataParallelTimeList = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
         
-            initCfg = (globalBatch, inputWidth, inputWidth, in_channels, v) # (batch, width, height, channel, filter)
+            # self.name = name
+            # self.params = params
+            # self.prevLayers = prevLayers                    # [(LayerId, inputByteSize), ...]
+            # self.module = module
+            # self.inputDim = (0, 0, 0)   # (Width, Height, Channel) for 2d convolution
+            # self.outputDim = (0, 0, 0)  # (Width, Height, Channel)
+
+            if layer.name in ["conv2d"]:
+                initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2], layer.outputDim[2]) # (batch, width, height, channel, filter)
+            elif layer.name in ["linear", "ReLU1d"]:
+                # initCfg = (globalBatch, layer.params["in_features"], layer.params["out_features"])
+                initCfg = (globalBatch, layer.inputDim, layer.outputDim)
+            elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+                initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2]) # (batch, width, height, channel, filter)
             initialConfigs.append(initCfg)
-            bestTime = runConv2dBench(initCfg, device, args)
+
+            if layer.name in ["conv2d"]:
+                bestTime = profiler.runConv2dBench(initCfg)
+            elif layer.name in ["linear"]:
+                bestTime = profiler.runLinearBench(initCfg)
+            else:
+                bestTime = 0
+            bestDataParallelTime = bestTime
             initialTimes.append(bestTime)
+
             bestConfig = initCfg
-            print("  Finding best split for: b=%d, w=%d, h=%d, c=%d, f=%d" % initCfg, end="")
-            print("  non-split time: %4.f"%bestTime)
+            # if layer.name in ["conv2d", "maxPool2d", "avgPool2d", "ReLU"]:
+            #     print("  Finding best split for: b=%d, w=%d, h=%d, c=%d, f=%d" % initCfg, end="")
+            #     print("  non-split time: %4.f"%bestTime)
+            # elif layer.name in ["linear"]:
+            #     print("  Finding best split for linear: b=%d, in=%d, out=%d" % initCfg, end="")
+            #     print("  non-split time: %4.f"%bestTime)
             
-            totalSplits = int(math.log(numGpus, 2))
-            configCandidates = [(int(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
-                                for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) for fs in range(totalSplits - bs - whs + 1)]
-            # configCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**int(whs/2)), int(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], int(initCfg[4] / 2**fs) )
-            #                     for bs in range(totalSplits + 1) for whs in [0] for fs in [0]]
-            # configCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**int(whs/2) + 0.5), int(initCfg[1] / 2**int(whs/2+0.5) + 0.5), initCfg[3], int(initCfg[4] / 2**fs + 0.5) )
-            #                     for bs in [2] for whs in [0] for fs in range(totalSplits - bs - whs + 1)]
-            # print(configCandidates)
+            totalSplits = int(math.log(totalGpus, 2))
+            if layer.name in ["conv2d"]:
+                configCandidates = [(int(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
+                                    for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) for fs in range(totalSplits - bs - whs + 1)]
+                dpConfigCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**int(whs/2)), int(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], int(initCfg[4] / 2**fs) )
+                                    for bs in range(totalSplits + 1) for whs in [0] for fs in [0]]
+                # configCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**int(whs/2) + 0.5), int(initCfg[1] / 2**int(whs/2+0.5) + 0.5), initCfg[3], int(initCfg[4] / 2**fs + 0.5) )
+                #                     for bs in [2] for whs in [0] for fs in range(totalSplits - bs - whs + 1)]
+                # print(configCandidates)
+            elif layer.name in ["linear", "ReLU1d"]:
+                configCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**ins), int(initCfg[2] / 2**outs) )
+                                for bs in range(totalSplits + 1) for ins in range(totalSplits - bs + 1) for outs in range(totalSplits - bs - ins + 1)]
+                dpConfigCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**ins), int(initCfg[2] / 2**outs) )
+                                    for bs in range(totalSplits + 1) for ins in [0] for outs in [0] ]
+            elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+                configCandidates = [(int(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+                                    for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) ]
+                dpConfigCandidates = [(int(initCfg[0] / 2**bs), int(initCfg[1] / 2**int(whs/2)), int(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+                                    for bs in range(totalSplits + 1) for whs in [0] ]
+                
+
 
             for config in configCandidates:
                 # Check validity of config.
                 invalidConfig = False
-                for dim in range(5):
+                for dim in range(len(config)):
                     if config[dim] < 1:
                         invalidConfig = True
                         break
@@ -477,38 +569,110 @@ class CostSim:
                     continue
                 
                 # Benchmark GPU time
-                gpuTime = runConv2dBench(config, device, args)
-                print("  config: b=%2d, w=%3d, h=%3d, c=%2d, f=%3d  " % config, end="")
-                print("time: %6.f" % gpuTime)
+                if layer.name in ["conv2d"]:
+                    gpuTime = profiler.runConv2dBench(config)
+                    # print("  config: b=%2d, w=%3d, h=%3d, c=%2d, f=%3d  " % config, end="")
+                    # print("time: %6.f" % gpuTime)
+                elif layer.name in ["linear"]:
+                    gpuTime = profiler.runLinearBench(config)
+                    # print("  config: b=%2d, in=%3d, out=%3d  " % config, end="")
+                    # print("time: %6.f" % gpuTime)
+                else:
+                    gpuTime = 0
                 
                 # Computer all-reduce time
-                syncTime = calcConv2dSyncTime(config)
+                if layer.name in ["conv2d"]:
+                    syncTime = self.calcConv2dSyncTime(config)
+                elif layer.name in ["linear"]:
+                    syncTime = self.calcLinearSyncTime(config, globalBatch)
+                else:
+                    syncTime = 0
                 
                 if i == 0:
-                    t[i].append((config, gpuTime + syncTime, None, (0, 0, gpuTime, syncTime) ))
+                    t[i].append((config, gpuTime + syncTime, None, (0, 0, gpuTime, syncTime, (0)) ))
                 else:
                     bestPrevCfgIdx = 0
                     bestCumulativeTime = 99999999999
                     bestTimeComposition = None
-                    for prevCfgIdx in range(len(t[i-1])):
-                        prevCfg, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[i-1][prevCfgIdx]
-                        activationTime = calcConv2dActivationTime(prevCfg, config, inputWidth)
+
+                    # WARNING!! Following main branch only!!
+                    prevLayer = layer.prevLayers[0]
+                    for prevCfgIdx in range(len(t[prevLayer.id])):
+                        prevCfg, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[prevLayer.id][prevCfgIdx]
+                        activationTime, activationSizeMatrix = self.calcInputXfer(prevLayer, layer, prevCfg, config)
+                        print(activationSizeMatrix)
+
                         if cumulativeTime + activationTime + gpuTime + syncTime < bestCumulativeTime:
                             bestCumulativeTime = cumulativeTime + activationTime + gpuTime + syncTime
-                            bestTimeComposition = (cumulativeTime, activationTime, gpuTime, syncTime)
+                            bestTimeComposition = (cumulativeTime, activationTime, gpuTime, syncTime, activationSizeMatrix)
                             bestPrevCfgIdx = prevCfgIdx
+                            
                     t[i].append((config, bestCumulativeTime, bestPrevCfgIdx, bestTimeComposition ))
-                
-                # TODO: remove this.
+
                 if gpuTime < bestTime:
                     bestTime = gpuTime
                     bestConfig = config
+                if config in dpConfigCandidates and gpuTime < bestDataParallelTime:
+                    bestDataParallelTime = gpuTime
             
             bestConfigList.append(bestConfig)
             bestTimeList.append(bestTime)
-            print("Layer%2d  " % i, end="")
-            print("config: b=%2d, w=%3d, h=%3d, c=%2d, f=%3d  " % bestConfig, end="")
-            print("time: %6.1f" % bestTime)
+            bestDataParallelTimeList.append(bestDataParallelTime)
+            # print("Layer%2d  " % i, end="")
+            # if layer.name in ["conv2d", "maxPool2d", "avgPool2d", "ReLU"]:
+            #     print("config: b=%2d, w=%3d, h=%3d, c=%2d, f=%3d  " % bestConfig, end="")
+            # elif layer.name in ["linear"]:
+            #     print("config: b=%2d, in=%5d, out=%5d  " % bestConfig, end="")
+            # print("time: %6.1f" % bestTime)
+
+        print("Network bandwidth: %5.f Gbps" % (self.NET_BANDWIDTH * 8 / 1000))
+        print("Best GPU-only time: %6.1f" % (sum(bestTimeList)))
+        # print("Total with maxpool + linear layers: %6.1f" % (sum(bestTimeList) + 425 + 1100))
+        
+        bestDpTime = 99999999999
+        cfgIdx = 0
+        for idx in range(len(t[len(t)-1])):
+            prevCfg, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[i][idx]
+            if cumulativeTime < bestDpTime:
+                bestDpTime = cumulativeTime
+                cfgIdx = prevConfigIndexOfPrev
+        bestConfigChain = [None for i in range(len(t))]
+        print("Best DP time: %6.f"%bestDpTime)
+        for i in range(len(t) - 1, -1, -1):
+            bestConfigChain[i] = cfgIdx
+            # print("for layer%2d, cfgIdx: %2d" % (i, cfgIdx))
+            config, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[i][cfgIdx]
+            cfgIdx = prevConfigIndexOfPrev
+
+        print("Layer    type       initial configuration          => after split configuration            time (us) |   prev inptXfer  gpuTime syncTime bestGpuTime dpGpuTime noParallelTime")
+        for i in range(len(bestConfigChain)):
+            config, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[i][bestConfigChain[i]]
+            print(" %2d " % i, end="")
+            layer = self.layers[i]
+            if layer.name in ["conv2d"]:
+                print("%9s (b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) => " % (layer.name, *initialConfigs[i]), end="")
+                print("(b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) " % config, end="")
+            elif layer.name in ["linear", "ReLU1d"]:
+                print("%9s (b=%2d, in=%6d, out=%6d)        => " % (layer.name, *initialConfigs[i]), end="")
+                print("(b=%2d, in=%6d, out=%6d)        " % config, end="")
+            elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+                print("%9s (b=%2d, w=%3d, h=%3d, c=%4d)         => " % (layer.name, *initialConfigs[i]), end="")
+                print("(b=%2d, w=%3d, h=%3d, c=%4d)         " % config, end="")
             
-            in_channels = v
-            
+            gpuTimeScaling = (initialTimes[i] / timeComposition[2]) if timeComposition[2] > 0 else 0
+            print("   %6.f   %6.f   %6.f   %6.f   %6.f      %6.f    %6.f  %6.f (%4.1fx)  %10s"
+                    % (cumulativeTime, timeComposition[0], timeComposition[1], timeComposition[2], timeComposition[3], bestTimeList[i], bestDataParallelTimeList[i], initialTimes[i], gpuTimeScaling, str(timeComposition[4])))
+        
+        print("-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+        print("  Sum                                                                                      ", end="")
+        print("   %6.f   %6.f   %6.f   %6.f   %6.f      %6.f    %6.f  %6.f (%4.1fx)"
+                % (t[len(bestConfigChain)-1][bestConfigChain[len(bestConfigChain)-1]][1],
+                    0,
+                    sum(t[i][bestConfigChain[i]][3][1] for i in range(len(bestConfigChain))),
+                    sum(t[i][bestConfigChain[i]][3][2] for i in range(len(bestConfigChain))),
+                    sum(t[i][bestConfigChain[i]][3][3] for i in range(len(bestConfigChain))),
+                    sum(bestTimeList),
+                    sum(bestDataParallelTimeList),
+                    sum(initialTimes),
+                    sum(initialTimes) / sum(t[i][bestConfigChain[i]][3][2] for i in range(len(bestConfigChain)))
+                    ))

@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
-
+from costSimulator import CostSim
+from costSimulator import GpuProfiler
 
 __all__ = [
     'VGG', 'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn',
@@ -29,14 +30,15 @@ class VGG(nn.Module):
         split1side = int(split_count**0.5)
         inChannels = int(512 / split1side)
         # print("linear intake features: %d"%int(512 * 7 * 7 / split1side))
+        cs.Flatten()
         self.classifier = nn.Sequential(
-            nn.Linear(int(inChannels * 7 * 7), int(4096/split1side)),
-            nn.ReLU(True),
+            cs.Linear(int(inChannels * 7 * 7), int(4096/split1side)),
+            cs.ReLU(True),
             nn.Dropout(),
-            nn.Linear(int(4096 / split1side), int(4096/split1side)),
-            nn.ReLU(True),
+            cs.Linear(int(4096 / split1side), int(4096/split1side)),
+            cs.ReLU(True),
             nn.Dropout(),
-            nn.Linear(int(4096 / split1side), int(num_classes)),
+            cs.Linear(int(4096 / split1side), int(num_classes)),
         )
         if init_weights:
             self._initialize_weights()
@@ -68,15 +70,15 @@ def make_layers(cfg, split_count=1, batch_norm=False):
     i = 0
     for v in cfg:
         if v == 'M':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+            layers += [cs.MaxPool2d(kernel_size=2, stride=2)]
         else:
             # if i == len(cfg) - 2: # last convolutional layer.
                 # print("lastConv2d out channel: %d"%v)
-            conv2d = nn.Conv2d(in_channels, (v / split_count), kernel_size=3, padding=1)
+            conv2d = cs.Conv2d(in_channels, int(v / split_count), kernel_size=3, padding=1)
             # if batch_norm:
             #     layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
             # else:
-            layers += [conv2d, nn.ReLU(inplace=True)] #self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+            layers += [conv2d, cs.ReLU(inplace=True)] #self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
             in_channels = v
         i += 1
     return nn.Sequential(*layers)
@@ -227,8 +229,8 @@ def vgg16(splitCount=1, pretrained=False, **kwargs):
     """
     if pretrained:
         kwargs['init_weights'] = False
-    # model = VGG(make_layers(cfg['D'], splitCount), split_count=splitCount, **kwargs)
-    model = VGG16(split_count=splitCount, **kwargs)
+    model = VGG(make_layers(cfg['D'], splitCount), split_count=splitCount, **kwargs)
+    # model = VGG16(split_count=splitCount, **kwargs)
     if pretrained:
         model.load_state_dict(model_zoo.load_url(model_urls['vgg16']))
     return model
@@ -274,3 +276,15 @@ def vgg19_bn(pretrained=False, **kwargs):
     if pretrained:
         model.load_state_dict(model_zoo.load_url(model_urls['vgg19_bn']))
     return model
+
+cs = CostSim()
+model = vgg16(pretrained=False)
+# model = resnet18()
+# model = resnet34()
+cs.printAllLayers()
+cs.computeInputDimensions((224,224,3))
+profiler = GpuProfiler("cuda")
+profiler.loadProfile()
+cs.searchBestSplits(profiler, 16, 16)
+profiler.saveProfile()
+
