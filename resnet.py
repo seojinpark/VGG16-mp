@@ -193,6 +193,7 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
         self.avgpool = cs.AdaptiveAvgPool2d((1, 1))
+        cs.Flatten()
         self.fc = cs.Linear(512 * block.expansion, num_classes)
 
         for m in self.modules():

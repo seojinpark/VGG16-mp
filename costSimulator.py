@@ -170,7 +170,7 @@ class GpuProfiler:
         height = config[2]
         inChannels = config[3]
         filterCount = config[4]
-        train_dataset = self.SyntheticDataset((inChannels, width, height), batchSize * 10)
+        train_dataset = self.SyntheticDataset((inChannels, width, height), batchSize * 30)
         train_loader = torch.utils.data.DataLoader(
                 train_dataset, batch_size=batchSize, shuffle=False, pin_memory=True, drop_last=True)
 
@@ -194,7 +194,7 @@ class GpuProfiler:
         batchSize = config[0]
         inFeatures = config[1]
         outFeatures = config[2]
-        train_dataset = self.SyntheticDataset((inFeatures), batchSize * 10, num_classes=outFeatures)
+        train_dataset = self.SyntheticDataset((inFeatures), batchSize * 20, num_classes=outFeatures)
         train_loader = torch.utils.data.DataLoader(
                 train_dataset, batch_size=batchSize, shuffle=False, pin_memory=True, drop_last=True)
 
@@ -316,9 +316,7 @@ class CostSim:
             #srcConfig, destConfig, destLayer.inputDim)
         elif srcLayer.name in namesIn1d + ["flatten"] and \
                 destLayer.name in namesIn1d:
-            return self.calcLinearActivationTime(srcConfig, destConfig, destLayer.inputDim)
-        # elif destLayer.name in ["ReLU"]:
-        #     return 0
+            return self.calcLinearActivationTime(srcLayer, destLayer, srcConfig, destConfig)
         else:
             print("Can't compute input transfer time from %s to %s." % (srcLayer.name, destLayer.name))
 
@@ -345,7 +343,10 @@ class CostSim:
         commonSize = bytesPerParam * min(srcS, destS) * min(srcW, destW) * min(srcH, destH) * min(srcOutChannel, destInChannel)
 
         # Halo exchange
-        haloLen = int((destLayer.params["kernel_size"] - 1) / 2)
+        if "kernel_size" in destLayer.params: # TODO: hack for adaptive avgPool2D.
+            haloLen = int((destLayer.params["kernel_size"] - 1) / 2)
+        else:
+            haloLen = 0
         haloPixels = 2 * haloLen * ((destW + haloLen) if destW != destLayer.inputDim[1] else 0)\
                      + 2 * haloLen * ((destH + haloLen) if destH != destLayer.inputDim[2] else 0)
         haloSize = bytesPerParam * min(srcS, destS) * haloPixels * min(srcOutChannel, destInChannel)
@@ -355,7 +356,6 @@ class CostSim:
         ingressBytes = bytesPerParam * destS * destW * destH * destInChannel - commonSize + haloSize
         activationTime = max(egressBytes, ingressBytes) / self.NET_BANDWIDTH
         activationTime += self.NET_LATENCY if activationTime > 0 else 0
-        print((egressBytes, ingressBytes, haloSize))
         return (2 * activationTime, (egressBytes, ingressBytes, haloSize)) # double to count both forward and backward passes.
 
     def calcLinearSyncTime(self, config, globalBatch, bytesPerParam=4, alwaysPaySyncTime=False):
@@ -367,38 +367,35 @@ class CostSim:
         size = params * bytesPerParam
         return size / self.NET_BANDWIDTH # Returns microseconds.
         
-    def calcLinearActivationTime(self, prevCfg, config, in_features, bytesPerInput=4):
+    def calcLinearActivationTime(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple):
+        bytesPerParam = 4
+        # Prepare variables.
         prevOutFeatures = 0
-        if len(prevCfg) == 5: # prev layer was conv2d.
-            batchSize = prevCfg[0]
-            width = prevCfg[1]
-            height = prevCfg[2]
-            inChannels = prevCfg[3]
-            filterCount = prevCfg[4]
-            
-            prevOutFeatures = batchSize * width * height * filterCount
-        elif len(prevCfg) == 3:
-            prevOutFeatures = prevCfg[2]
-        
-        # batchSize = config[0]
-        # inFeatures = config[1]
-        # outFeatures = config[2]
-        
-        activationTime = 0
-        # Change in batch size
-        # if config[0] != prevCfg[0]:
-        #     xferSamples = abs(config[0]-prevCfg[0])
-        #     xferInput = inFeatures
-        #     size = xferSamples * xferInput * bytesPerInput
-        #     activationTime += size / self.NET_BANDWIDTH
+        if len(srcConfig) >= 4: # prev layer was conv2d.
+            # print("%s to %s" % (srcLayer.name, destLayer.name))
+            srcS = srcConfig[0]
+            srcW = srcConfig[1] * 1 if srcLayer.name == "flatten" else (srcLayer.outputDim[0] // srcLayer.inputDim[0]) # Adjusts based on input/output ratio. 
+            srcH = srcConfig[2] * 1 if srcLayer.name == "flatten" else (srcLayer.outputDim[1] // srcLayer.inputDim[1]) # It's necessary for pool or conv2d with stride > 1
+            srcOutChannel = srcConfig[4] if len(srcConfig) >= 5 else srcConfig[3] # non-convolutional 2d layers don't have filter.
+            srcOutFeatures = srcS * srcW * srcH * srcOutChannel
+            splitFactor = 1
+        elif len(srcConfig) == 3:
+            srcS = srcConfig[0]
+            srcOutFeatures = srcConfig[2]
+            splitFactor = srcLayer.inputDim / srcConfig[1] # This much output must be added up to get the final output.
+        else:
+            print("[calcLinearActivationTime] error! srcConfig dimensions is not correct.")
+        destS = destConfig[0]
+        destInFeatures = destConfig[1]
 
-        if prevOutFeatures < in_features or config[1] < in_features:
-            # Just overestimate for now..
-            size = config[0] * in_features * bytesPerInput
-            activationTime += size / self.NET_BANDWIDTH
-            activationTime += 10 if activationTime > 0 else 0
-        
-        return (2 * activationTime, (config[0] * in_features * bytesPerInput))
+        commonSize = bytesPerParam * min(srcS, destS) * min(srcOutFeatures, destInFeatures)
+
+        # compute times
+        egressBytes = bytesPerParam * srcS * srcOutFeatures * splitFactor - commonSize
+        ingressBytes = bytesPerParam * destS * destInFeatures * splitFactor - commonSize
+        activationTime = max(egressBytes, ingressBytes) / self.NET_BANDWIDTH
+        activationTime += self.NET_LATENCY if activationTime > 0 else 0
+        return (2 * activationTime, (egressBytes, ingressBytes, splitFactor)) # double to count both forward and backward passes.
 
     def Conv2d(self,
             in_channels: int,
@@ -489,6 +486,37 @@ class CostSim:
             custom_previous_layers = [self.layers[-1]]
         layer = CostSim.Layer(None, "flatten", {"kernel_size": 1}, prevLayers = custom_previous_layers)
         self.layers.append(layer)
+        return
+
+    def searchMultiChain(self, startLayer, startConfig, gpuCount):
+        k = len(startLayer.nextLayers)
+        ilist = [0 for j in range(k)]
+        llist = [[startLayer] for j in range(k)]
+        for j in range(k):
+            l = startLayer.nextLayers[j]
+            while len(l.prevLayers) == 1: # Until join happens.
+                llist[j].append(l)
+                if len(l.nextLayers) > 1:
+                    print("[searchMultiChain] ERROR! nested multi-chain. TODO; implement handling of this.")
+                l = l.nextLayers[0]
+
+        ln = [len(llist[j] for j in range(k))]
+
+        # Start dynamic programming.
+        t = {}
+        t[tuple(ilist)] = tuple([0 for j in range(k)])
+        gpuReadyTime = {}
+        gpuReadyTime[tuple(ilist)] = [0 for j in range(gpuCount)]
+        def generateAllConfigs(k: int, index: int, ln: list):
+            if k == 0:
+                return []
+            
+            for nextIndex in ln[0]:
+                generateConfigs(k-1, llist).append(index)
+
+            
+
+
         return
 
     def searchBestSplits(self, profiler: GpuProfiler, totalGpus: int, globalBatch: int = 16):
@@ -600,7 +628,6 @@ class CostSim:
                     for prevCfgIdx in range(len(t[prevLayer.id])):
                         prevCfg, cumulativeTime, prevConfigIndexOfPrev, timeComposition = t[prevLayer.id][prevCfgIdx]
                         activationTime, activationSizeMatrix = self.calcInputXfer(prevLayer, layer, prevCfg, config)
-                        print(activationSizeMatrix)
 
                         if cumulativeTime + activationTime + gpuTime + syncTime < bestCumulativeTime:
                             bestCumulativeTime = cumulativeTime + activationTime + gpuTime + syncTime
@@ -618,12 +645,11 @@ class CostSim:
             bestConfigList.append(bestConfig)
             bestTimeList.append(bestTime)
             bestDataParallelTimeList.append(bestDataParallelTime)
-            # print("Layer%2d  " % i, end="")
-            # if layer.name in ["conv2d", "maxPool2d", "avgPool2d", "ReLU"]:
-            #     print("config: b=%2d, w=%3d, h=%3d, c=%2d, f=%3d  " % bestConfig, end="")
-            # elif layer.name in ["linear"]:
-            #     print("config: b=%2d, in=%5d, out=%5d  " % bestConfig, end="")
-            # print("time: %6.1f" % bestTime)
+            
+            if len(layer.nextLayers) == 1:
+                print("sequencial transition.")
+            elif len(layer.nextLayers) > 1:
+                self.searchMultiChain(layer)
 
         print("Network bandwidth: %5.f Gbps" % (self.NET_BANDWIDTH * 8 / 1000))
         print("Best GPU-only time: %6.1f" % (sum(bestTimeList)))
