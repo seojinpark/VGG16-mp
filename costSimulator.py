@@ -488,6 +488,41 @@ class CostSim:
         self.layers.append(layer)
         return
 
+    def listConfigOptions(self, layer, globalBatch: int, totalGpus: int):
+        if layer.name in ["conv2d"]:
+            initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2], layer.outputDim[2]) # (batch, width, height, channel, filter)
+        elif layer.name in ["linear", "ReLU1d"]:
+            initCfg = (globalBatch, layer.inputDim, layer.outputDim)
+        elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+            initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2]) # (batch, width, height, channel, filter)
+        
+        totalSplits = int(math.log(totalGpus, 2))
+        if layer.name in ["conv2d"]:
+            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
+                                for whs in range(totalSplits + 1) for fs in range(totalSplits - whs + 1) for gpusForBatch in range(totalGpus - 2**(whs + fs) + 1) ]
+        elif layer.name in ["linear", "ReLU1d"]:
+            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**ins), math.ceil(initCfg[2] / 2**outs) )
+                                for ins in range(totalSplits + 1) for outs in range(totalSplits - ins + 1) for gpusForBatch in range(totalGpus - 2**(ins + outs) + 1) ]
+        elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+                                for whs in range(totalSplits + 1) for gpusForBatch in range(totalGpus - 2**(whs) + 1) ]
+        # if layer.name in ["conv2d"]:
+        #     configCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
+        #                         for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) for fs in range(totalSplits - bs - whs + 1)]
+        #     dpConfigCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
+        #                         for bs in range(totalSplits + 1) for whs in [0] for fs in [0]]
+        # elif layer.name in ["linear", "ReLU1d"]:
+        #     configCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**ins), math.ceil(initCfg[2] / 2**outs) )
+        #                     for bs in range(totalSplits + 1) for ins in range(totalSplits - bs + 1) for outs in range(totalSplits - bs - ins + 1)]
+        #     dpConfigCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**ins), math.ceil(initCfg[2] / 2**outs) )
+        #                         for bs in range(totalSplits + 1) for ins in [0] for outs in [0] ]
+        # elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
+        #     configCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+        #                         for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) ]
+        #     dpConfigCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+        #                         for bs in range(totalSplits + 1) for whs in [0] ]
+        return configCandidates
+                                
     def searchMultiChain(self, startLayer, startConfig, gpuCount):
         k = len(startLayer.nextLayers)
         ilist = [0 for j in range(k)]
@@ -507,12 +542,13 @@ class CostSim:
         t[tuple(ilist)] = tuple([0 for j in range(k)])
         gpuReadyTime = {}
         gpuReadyTime[tuple(ilist)] = [0 for j in range(gpuCount)]
-        def generateAllConfigs(k: int, index: int, ln: list):
+        def generateAllConfigs(k: int, index: int, llist: list):
             if k == 0:
                 return []
             
-            for nextIndex in ln[0]:
-                generateConfigs(k-1, llist).append(index)
+            for nextIndex in range(len(llist[0])):
+                for config in self.listConfigOptions(llist[0][nextIndex], )
+                generateConfigs(k-1, llist[1:]).append(index)
 
             
 
