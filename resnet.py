@@ -410,6 +410,6 @@ cs.printAllLayers()
 cs.computeInputDimensions((224,224,3))
 profiler = GpuProfiler("cuda")
 profiler.loadProfile()
-cs.searchBestSplits(profiler, 16, 16)
+cs.searchBestSplits(profiler, 4, 16)
 profiler.saveProfile()
 

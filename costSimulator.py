@@ -498,14 +498,14 @@ class CostSim:
         
         totalSplits = int(math.log(totalGpus, 2))
         if layer.name in ["conv2d"]:
-            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
-                                for whs in range(totalSplits + 1) for fs in range(totalSplits - whs + 1) for gpusForBatch in range(totalGpus - 2**(whs + fs) + 1) ]
+            configCandidates = [(math.ceil(initCfg[0] / replicas), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
+                                for whs in range(totalSplits + 1) for fs in range(totalSplits - whs + 1) for replicas in range(1, 2**(totalSplits - whs - fs) + 1) ]
         elif layer.name in ["linear", "ReLU1d"]:
-            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**ins), math.ceil(initCfg[2] / 2**outs) )
-                                for ins in range(totalSplits + 1) for outs in range(totalSplits - ins + 1) for gpusForBatch in range(totalGpus - 2**(ins + outs) + 1) ]
+            configCandidates = [(math.ceil(initCfg[0] / replicas), math.ceil(initCfg[1] / 2**ins), math.ceil(initCfg[2] / 2**outs) )
+                                for ins in range(totalSplits + 1) for outs in range(totalSplits - ins + 1) for replicas in range(1, 2**(totalSplits - ins - outs) + 1) ]
         elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
-            configCandidates = [(math.ceil(initCfg[0] / gpusForBatch), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
-                                for whs in range(totalSplits + 1) for gpusForBatch in range(totalGpus - 2**(whs) + 1) ]
+            configCandidates = [(math.ceil(initCfg[0] / replicas), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
+                                for whs in range(totalSplits + 1) for replicas in range(1, 2**(totalSplits - whs) + 1) ]
         # if layer.name in ["conv2d"]:
         #     configCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
         #                         for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) for fs in range(totalSplits - bs - whs + 1)]
@@ -521,12 +521,23 @@ class CostSim:
         #                         for bs in range(totalSplits + 1) for whs in range(totalSplits - bs + 1) ]
         #     dpConfigCandidates = [(math.ceil(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
         #                         for bs in range(totalSplits + 1) for whs in [0] ]
-        return configCandidates
-                                
-    def searchMultiChain(self, startLayer, startConfig, gpuCount):
+
+        validConfigs = []
+        for config in configCandidates:
+            invalidConfig = False
+            for dim in range(len(config)):
+                if config[dim] < 1:
+                    invalidConfig = True
+                    break
+                # add some other rules..
+            if not invalidConfig:
+                validConfigs.append(config)
+        return validConfigs
+
+    def searchMultiChain(self, profiler: GpuProfiler, startLayer, startConfig, globalBatch: int, totalGpus: int):
         k = len(startLayer.nextLayers)
-        ilist = [0 for j in range(k)]
         llist = [[startLayer] for j in range(k)]
+        endLayer = None
         for j in range(k):
             l = startLayer.nextLayers[j]
             while len(l.prevLayers) == 1: # Until join happens.
@@ -534,26 +545,76 @@ class CostSim:
                 if len(l.nextLayers) > 1:
                     print("[searchMultiChain] ERROR! nested multi-chain. TODO; implement handling of this.")
                 l = l.nextLayers[0]
+            if endLayer == None:
+                endLayer = l
+            else:
+                assert(endLayer == l)
 
-        ln = [len(llist[j] for j in range(k))]
+        print("Found %d chains, branching at %d-th layer, joining at %d-th layer" % (k, startLayer.id, endLayer.id))
 
         # Start dynamic programming.
-        t = {}
-        t[tuple(ilist)] = tuple([0 for j in range(k)])
-        gpuReadyTime = {}
-        gpuReadyTime[tuple(ilist)] = [0 for j in range(gpuCount)]
-        def generateAllConfigs(k: int, index: int, llist: list):
+        def generateAllConfigs(k: int, llist: list):
             if k == 0:
-                return []
-            
-            for nextIndex in range(len(llist[0])):
-                for config in self.listConfigOptions(llist[0][nextIndex], )
-                generateConfigs(k-1, llist[1:]).append(index)
+                return [[]]
+            configs = []
+            for laterPart in generateAllConfigs(k-1, llist[1:]):
+                configs.append([(0, startConfig)] + laterPart)
 
-            
+            for nextIndex in range(1, len(llist[0])):
+                for config in self.listConfigOptions(llist[0][nextIndex], globalBatch, totalGpus):
+                    laterPartList = generateAllConfigs(k-1, llist[1:])
+                    # print("[generateAllConfigs] for k=%d, (%d, %s), got %s" % (k, nextIndex, str(config), str(laterPartList)))
+                    for laterPart in laterPartList:
+                        completePart = [(nextIndex, config)] + laterPart
+                        configs.append(completePart)
+            return configs
+        
+        allCombinedIdx = generateAllConfigs(k, llist)
+        initialIdx = tuple(allCombinedIdx[0])
+        t = {}
+        gpuReadyTime = {}
+        t[initialIdx] = tuple([0 for j in range(k)])
+        gpuReadyTime[initialIdx] = [0 for j in range(totalGpus)]
+        for combinedIdxAndConfig in allCombinedIdx[1:]:
+            # print(combinedIdx)
+            t[tuple(combinedIdxAndConfig)] = []
+            gpuReadyTime[tuple(combinedIdxAndConfig)] = []
+
+            for j in range(k):
+                prevIdx = combinedIdxAndConfig[j][0] - 1
+                currentIdx = combinedIdxAndConfig[j][0]
+                layer = llist[j][currentIdx]
+                prevLayer = llist[j][prevIdx]
+                currentConfig = combinedIdxAndConfig[j][1]
+                if layer.name in ["conv2d"]:
+                    gpuTime = profiler.runConv2dBench(currentConfig)
+                elif layer.name in ["linear"]:
+                    gpuTime = profiler.runLinearBench(currentConfig)
+                else:
+                    gpuTime = 0
+                
+                for prevConfig in self.listConfigOptions(llist[j][prevIdx], globalBatch, totalGpus):
+                    prevCombinedIdxAndConfig = combinedIdxAndConfig
+                    prevCombinedIdxAndConfig[j] = (prevIdx, prevConfig)
+                    prevCombined = tuple(prevCombinedIdxAndConfig)
+                    for optionIdx in range(len(t[prevCombined])):
+                        # compute time.
+                        prevTimeVec = t[prevCombined][optionIdx]
+                        prevGpuReady = gpuReadyTime[prevCombined][optionIdx]
+                        activationTime, activationSizeMatrix = self.calcInputXfer(prevLayer, layer, prevConfig, currentConfig)
+                        
+                        # First, compute the earliest time it can finish j-th chain.
+                        prevBranchReady = prevTimeVec[j]
+                        gpusNeeded = 
+                        sorted(prevGpuReady)[]
+                    
+            # Filter by lamportMin.
 
 
-        return
+        
+        # TODO: Final join to end layer.
+        configToTimeDict = {}
+        return (endLayer, configToTimeDict)
 
     def searchBestSplits(self, profiler: GpuProfiler, totalGpus: int, globalBatch: int = 16):
         t = [[] for i in range(len(self.layers))] # [layer] = list of (config, cumulativeTime, prevConfigIndex)
@@ -576,7 +637,6 @@ class CostSim:
             if layer.name in ["conv2d"]:
                 initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2], layer.outputDim[2]) # (batch, width, height, channel, filter)
             elif layer.name in ["linear", "ReLU1d"]:
-                # initCfg = (globalBatch, layer.params["in_features"], layer.params["out_features"])
                 initCfg = (globalBatch, layer.inputDim, layer.outputDim)
             elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "ReLU2d"]:
                 initCfg = (globalBatch, layer.inputDim[0], layer.inputDim[1], layer.inputDim[2]) # (batch, width, height, channel, filter)
@@ -685,7 +745,8 @@ class CostSim:
             if len(layer.nextLayers) == 1:
                 print("sequencial transition.")
             elif len(layer.nextLayers) > 1:
-                self.searchMultiChain(layer)
+                for config in configCandidates:
+                    self.searchMultiChain(profiler, layer, config, globalBatch, totalGpus)
 
         print("Network bandwidth: %5.f Gbps" % (self.NET_BANDWIDTH * 8 / 1000))
         print("Best GPU-only time: %6.1f" % (sum(bestTimeList)))
