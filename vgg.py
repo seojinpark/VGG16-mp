@@ -277,14 +277,14 @@ def vgg19_bn(pretrained=False, **kwargs):
         model.load_state_dict(model_zoo.load_url(model_urls['vgg19_bn']))
     return model
 
-cs = CostSim()
-model = vgg16(pretrained=False)
-# model = resnet18()
+profiler = GpuProfiler("cuda")
+profiler.loadProfile()
+cs = CostSim(profiler, verbose=True)
+# model = vgg16(pretrained=False)
+model = vgg11()
 # model = resnet34()
 cs.printAllLayers()
 cs.computeInputDimensions((224,224,3))
-profiler = GpuProfiler("cuda")
-profiler.loadProfile()
-cs.searchBestSplits(profiler, 16, 16)
+cs.searchBestSplits(4, 16)
 profiler.saveProfile()
 
